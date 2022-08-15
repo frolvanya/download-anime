@@ -7,6 +7,9 @@ use reqwest::header;
 use select::document::Document;
 use select::predicate::Name;
 
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+
 use clap::Parser;
 
 /// Anime Downloader
@@ -26,22 +29,11 @@ struct Args {
     resolution: u16,
 }
 
-async fn if_episode_exists(url: String) -> bool {
-    let response = match reqwest::get(url).await {
-        Ok(res) => res,
-        Err(err) => {
-            println!("Wasn't able to send request due to {}", err);
-            return false;
-        }
-    };
-
-    let text = match response.text().await {
-        Ok(res) => res,
-        Err(err) => {
-            println!("Wasn't able to get text from response due to {}", err);
-            return false;
-        }
-    };
+fn if_episode_exists(client: Client, url: String) -> bool {
+    let response = client.get(url).send().expect("Wasn't able to send request");
+    let text = response
+        .text()
+        .expect("Wasn't able to get text from response");
 
     if text.contains(&"Страницы не существует или она была удалена.")
     {
@@ -51,22 +43,11 @@ async fn if_episode_exists(url: String) -> bool {
     true
 }
 
-async fn get_video_urls(client: Client, url: String) -> Vec<String> {
-    let response = match client.get(url).send() {
-        Ok(res) => res,
-        Err(err) => {
-            println!("Wasn't able to send request due to {}", err);
-            return Vec::new();
-        }
-    };
-
-    let text = match response.text() {
-        Ok(res) => res,
-        Err(err) => {
-            println!("Wasn't able to get text from response due to {}", err);
-            return Vec::new();
-        }
-    };
+fn get_video_urls(client: Client, url: String) -> Vec<String> {
+    let response = client.get(url).send().expect("Wasn't able to send request");
+    let text = response
+        .text()
+        .expect("Wasn't able to get text from response");
 
     Document::from(text.as_str())
         .find(Name("source"))
@@ -75,24 +56,21 @@ async fn get_video_urls(client: Client, url: String) -> Vec<String> {
         .collect::<Vec<String>>()
 }
 
-fn download_episode(client: Client, url: String, anime: String, episode: u16) {
-    let animation = tokio::spawn(loading_animation(episode));
-    let mut response = match client.get(url).send() {
-        Ok(res) => res,
-        Err(err) => {
-            println!("Wasn't able to send request due to {}", err);
-            return;
-        }
-    };
+fn download_episode(client: Client, send: Sender<bool>, url: String, anime: String, episode: u16) {
+    let mut response = client.get(url).send().expect("Wasn't able to send request");
 
-    animation.abort();
     match std::fs::File::create(format!("{}/episode-{}.mp4", anime, episode)) {
         Ok(mut file) => match std::io::copy(&mut response, &mut file) {
             Ok(_) => {
-                println!("{}✔", 8u8 as char);
+                send.send(true)
+                    .expect("An error occurred while sending the signal");
+                std::thread::sleep(time::Duration::from_secs(1));
             }
             Err(err) => {
-                println!("{}✘", 8u8 as char);
+                send.send(false)
+                    .expect("An error occurred while sending the signal");
+                std::thread::sleep(time::Duration::from_secs(1));
+
                 println!(
                     "Wasn't able to save `episode-{}.mp4` due to {}",
                     episode, err
@@ -100,7 +78,10 @@ fn download_episode(client: Client, url: String, anime: String, episode: u16) {
             }
         },
         Err(err) => {
-            println!("{}✘", 8u8 as char);
+            send.send(false)
+                .expect("An error occurred while sending the signal");
+            std::thread::sleep(time::Duration::from_secs(1));
+
             println!(
                 "Wasn't able to save `episode-{}.mp4` due to {}",
                 episode, err
@@ -109,12 +90,24 @@ fn download_episode(client: Client, url: String, anime: String, episode: u16) {
     };
 }
 
-async fn loading_animation(episode: u16) {
+fn loading_animation(episode: u16, recv: Receiver<bool>) {
     let frames = ["|", "/", "-", "\\"];
     print!("Episode {}:  ", episode);
 
     loop {
         for frame in frames {
+            match recv.try_recv() {
+                Ok(true) => {
+                    println!("{}✔", 8u8 as char);
+                    return;
+                }
+                Ok(false) => {
+                    println!("{}✘", 8u8 as char);
+                    return;
+                }
+                Err(_) => {}
+            };
+
             print!("{}{}", 8u8 as char, frame);
             std::io::stdout().flush().unwrap();
             std::thread::sleep(time::Duration::from_millis(100));
@@ -124,12 +117,21 @@ async fn loading_animation(episode: u16) {
 
 #[tokio::main]
 async fn main() {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::USER_AGENT, header::HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6 Safari/605.1.15"));
+    let client = reqwest::blocking::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+
     let args = Args::parse();
 
     let anime = args.anime;
-    if !if_episode_exists(format!("https://jut.su/{}/episode-1.html", anime.clone())).await {
-        println!("This anime doesn't exists");
-        std::process::exit(1);
+    if !if_episode_exists(
+        client.clone(),
+        format!("https://jut.su/{}/episode-1.html", anime.clone()),
+    ) {
+        panic!("This anime doesn't exists");
     };
 
     let episodes = match args.episodes.as_str() {
@@ -145,7 +147,7 @@ async fn main() {
                 range[1] = tmp_right_range;
             }
 
-            range[0]..range[1]
+            range[0]..range[1] + 1
         }
     };
 
@@ -154,60 +156,30 @@ async fn main() {
         480 => 2,
         720 => 1,
         1080 => 0,
-        _ => {
-            println!("Wrong resolution. Please, pick one of these: 360, 480, 720, 1080");
-            std::process::exit(1);
-        }
+        _ => panic!("Wrong resolution. Please, pick one of these: 360, 480, 720, 1080"),
     };
-
-    let mut headers = header::HeaderMap::new();
-    headers.insert(header::USER_AGENT, header::HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6 Safari/605.1.15"));
-    let client = reqwest::blocking::Client::builder()
-        .default_headers(headers)
-        .build()
-        .unwrap();
 
     match std::fs::create_dir(anime.clone()) {
         Err(_) => println!("`{}` folder is already exists", anime.clone()),
         Ok(_) => println!("Created `{}` folder", anime.clone()),
     }
 
-    // let mut download_episode_tasks = Vec::new();
     for episode in episodes {
-        // let client_clone = client.clone();
-        // let anime_clone = anime.clone();
+        let (send, recv) = channel();
 
         let url = format!("https://jut.su/{}/episode-{}.html", anime.clone(), episode);
-        if !if_episode_exists(url.clone()).await {
+        if !if_episode_exists(client.clone(), url.clone()) {
             break;
         }
 
-        let video_urls = get_video_urls(client.clone(), url.clone()).await;
+        let video_urls = get_video_urls(client.clone(), url.clone());
+        thread::spawn(move || loading_animation(episode, recv));
         download_episode(
             client.clone(),
+            send,
             video_urls[resolution].clone(),
             anime.clone(),
             episode,
         );
-
-        // let animation = tokio::spawn(loading_animation(episode));
-        // download_episode_tasks.push(tokio::spawn(async move {
-        //     download_episode(
-        //         client_clone,
-        //         video_urls[resolution].clone(),
-        //         anime_clone,
-        //         episode,
-        //     )
-        //     .await;
-        //     animation.abort();
-        // }));
-
-        // if download_episode_tasks.len() == 5 {
-        //     for task in download_episode_tasks {
-        //         task.await.expect("Panic in task")
-        //     }
-
-        //     download_episode_tasks = Vec::new();
-        // }
     }
 }
