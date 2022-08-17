@@ -1,3 +1,6 @@
+use core::time;
+use std::io::Write;
+use std::sync::mpsc::{channel, Receiver};
 use std::thread::{self, JoinHandle};
 
 use reqwest::blocking::Client;
@@ -8,7 +11,7 @@ use select::predicate::Name;
 
 use clap::Parser;
 
-/// Anime Downloader
+/// Anime& Downloader
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -63,33 +66,42 @@ fn download_episode(client: Client, url: String, anime: String, episode: u16) {
         .expect("Wasn't able to send request");
 
     if !response.status().is_success() {
-        println!("Bad response status! Trying again...");
+        println!("{}", response.status());
+        println!("Bad response status ({} episode)! Trying again...", episode);
+        std::thread::sleep(time::Duration::from_secs(2));
         download_episode(client, url, anime.clone(), episode);
     }
 
-    match std::fs::File::create(format!("{}/episode-{}.mp4", anime, episode)) {
-        Ok(mut file) => match std::io::copy(&mut response, &mut file) {
-            Ok(_) => {
-                println!("Episode {}: ✔", episode);
-            }
-            Err(err) => {
-                println!("Episode {}: ✘", episode);
+    let mut file = std::fs::File::create(format!("{}/episode-{}.mp4", anime, episode))
+        .expect(&format!("Wasn't able to save `episode-{}.mp4`", episode));
+    std::io::copy(&mut response, &mut file)
+        .expect(&format!("Wasn't able to save `episode-{}.mp4`", episode));
+}
 
-                println!(
-                    "Wasn't able to save `episode-{}.mp4` due to {}",
-                    episode, err
-                );
-            }
-        },
-        Err(err) => {
-            println!("Episode {}: ✘", episode);
+fn loading_animation(episodes: u16, recv: Receiver<()>) {
+    let frames = ["|", "/", "-", "\\"];
 
-            println!(
-                "Wasn't able to save `episode-{}.mp4` due to {}",
-                episode, err
-            );
+    if episodes == 1 {
+        print!("Downloading 1 episode:  ");
+    } else {
+        print!("Downloading {} episodes:  ", episodes);
+    }
+
+    loop {
+        for frame in frames {
+            match recv.try_recv() {
+                Ok(()) => {
+                    println!("{}✔", 8u8 as char);
+                    return;
+                }
+                Err(_) => {}
+            };
+
+            print!("{}{}", 8u8 as char, frame);
+            std::io::stdout().flush().unwrap();
+            std::thread::sleep(time::Duration::from_millis(100));
         }
-    };
+    }
 }
 
 fn wait_for_threads(threads: Vec<JoinHandle<()>>) {
@@ -139,7 +151,7 @@ fn main() {
         _ => panic!("Wrong resolution. Please, pick one of these: 360, 480, 720, 1080"),
     };
 
-    let concurrency = args.resolution;
+    let concurrency = args.concurrency;
 
     match std::fs::create_dir(anime.clone()) {
         Err(_) => println!("`{}` folder is already exists", anime),
@@ -166,10 +178,24 @@ fn main() {
         }));
 
         if episode % concurrency == 0 {
+            let (send, recv) = channel();
+
+            thread::spawn(move || loading_animation(concurrency, recv));
             wait_for_threads(threads);
+
+            send.send(())
+                .expect("Couldn't send signal to the loading animation");
             threads = Vec::new();
         }
     }
 
+    let (send, recv) = channel();
+
+    let length = threads.len();
+    thread::spawn(move || loading_animation(length as u16, recv));
     wait_for_threads(threads);
+
+    send.send(())
+        .expect("Couldn't send signal to the loading animation");
+    std::thread::sleep(time::Duration::from_millis(200));
 }
